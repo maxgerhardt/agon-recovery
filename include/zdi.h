@@ -28,7 +28,7 @@ public:
     uint32_t read_cpu_register (ZDI_RWControl cpureg);
         void write_cpu_register(ZDI_RWControl cpureg, uint32_t value);
         void read_memory (uint32_t address, uint32_t count, uint8_t* buffer);
-        void write_memory(uint32_t address, uint32_t count, uint8_t* buffer);
+        void write_memory(uint32_t address, uint32_t count, const uint8_t* buffer);
         void write_memory_32bit(uint32_t address, uint32_t value);
         void write_memory_24bit(uint32_t address, uint32_t value);
         void write_memory_16bit(uint32_t address, uint16_t value);

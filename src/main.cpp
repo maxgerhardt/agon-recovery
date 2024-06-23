@@ -1,16 +1,15 @@
 #include "zdi.h"
 #include "cpu.h"
-#include "fabgl.h"
 #include "eZ80F92.h"
 #include <esp_task_wdt.h>
 #include "esp32_io.h"
 #include "updater.h"
 #include "message.h"
-#include "SPIFFS.h"
 #include <CRC32.h>
+#include <XModem.h>
 
 #define PAGESIZE            2048
-#define USERLOAD            0x40000
+#define USERLOAD            0x40000 // start of RAM
 #define BREAKPOINT          0x40020
 #define FLASHLOAD           0x50000
 #define MOSSIZE_ADDRESS     0x70000
@@ -26,9 +25,12 @@
 #define ZDI_TCKPIN 26
 #define ZDI_TDIPIN 27
 
-fabgl::PS2Controller    PS2Controller;
-fabgl::VGA16Controller  DisplayController;
-fabgl::Terminal         terminal;
+#define EZ80F92_FLASHSIZE (128*1024)
+uint8_t* flash_buf;
+size_t flash_buf_idx = 0;
+unsigned long last_block_receive_time = 0;
+bool received_one_block = false;
+XModem xmodem;
 
 int ledpins[] = {2,4,16}; // should cover most esp32 boards, including ezsbc board
 int ledpins_onstate[] = {1,1,0}; // 1: Pin high == on, 0: Pin low == on
@@ -43,8 +45,9 @@ ZDI*                    zdi;
 
 char zdi_msg_up[] = "ZDI up - id 0x%04X, revision 0x%02X\r\n";
 char zdi_msg_down[] = "ZDI down - check cabling\r\n";
-char menuHeader[] = "Agon recovery utility v1.0\r\n\r\n";
-char menuMessage[] = "1: Recover MOS and VDP (Recovery utility running on internal ESP32)\r\n2: Recover MOS only\r\n3: Recover VDP only (Recovery utility running on internal ESP32)\r\n\r\nSelect option >";
+char menuHeader[] = "Agon flashing utility v1.0\r\n\r\n";
+
+bool process_block(void *blk_id, size_t idSize, byte *data, size_t dataSize);
 
 void setupLedPins(void) {
     for(int n = 0; n < (sizeof(ledpins) / sizeof(int)); n++)
@@ -86,27 +89,11 @@ void ledsWaitFlash(int32_t ms) {
     }
 }
 
-void vga_status_screen(void) {
-    fg_white();
-    terminal.write("\e[2J");     // clear screen
-    terminal.write("\e[1;1H");   // move cursor to 1,1
-    terminal.write(menuHeader);
-
-    if(zdi->get_productid() != 7) {
-        fg_red();
-        terminal.printf(zdi_msg_down);
-        fg_white();
-        terminal.write("\r\nConnect two jumper cables between the GPIO and ZDI ports:\r\n");
-        terminal.write(" - ESP GPIO26 to ZDI TCK (pin 4)\r\n");
-        terminal.write(" - ESP GPIO27 to ZDI TDI (pin 6)\r\n");
-        terminal.write("\r\nWhen using an external ESP32, connect ground between:\r\n");
-        terminal.write(" - ESP GND to ZDI GND (pin 5)\r\n");
-        terminal.write("\r\ndetailed connection diagrams can be found at\r\n");
-        terminal.write("https://github.com/envenomator/agon-recovery\r\n\r\n");
-    }
-    else {
-        terminal.printf(zdi_msg_up, zdi->get_productid(), zdi->get_revision());
-    }
+uint32_t getDataCRC(const uint8_t* data, size_t len) {
+    CRC32 crc;
+    for(size_t n = 0; n < len; n++) 
+        crc.update(data[n]);
+    return crc.finalize();
 }
 
 uint32_t getfileCRC(const char *name) {
@@ -132,6 +119,11 @@ void setup() {
     // Serial
     Serial.begin(115200);
 
+    flash_buf = (uint8_t*) malloc(EZ80F92_FLASHSIZE);
+    if(flash_buf == nullptr) {
+        Serial.println("FAIL: COULD NOT ALLOCATE FLASH BUF");
+    }
+
     // setup ZDI interface
     zdi = new ZDI(ZDI_TCKPIN, ZDI_TDIPIN);
     cpu = new CPU(zdi);
@@ -149,44 +141,13 @@ void setup() {
     // Boot-up display
     needmenu = true;
 
-    // setup keyboard/PS2
-    PS2Controller.begin(PS2Preset::KeyboardPort0, KbdMode::CreateVirtualKeysQueue);
-
-    // setup VGA display
-    DisplayController.begin();
-    DisplayController.setResolution(VGA_640x480_60Hz);
-    
-    // setup terminal
-    terminal.begin(&DisplayController);
-    terminal.enableCursor(true);
-
-    vga_status_screen();
-
     // Wait a little for serial comms
     delay(1000);
 
-    // Check files from SPIFFS partition
-    File bin_MOS;
-    File bin_flash;
+    //expected_moscrc = getfileCRC("/spiffs/MOS.bin");
+    // initialize some stuff
+    xmodem.begin(Serial, XModem::ProtocolType::XMODEM);
 
-    if(!SPIFFS.begin(true)){
-        displayMessage("An Error has occurred while mounting SPIFFS");
-        while(1) ledsFlash();
-    }
-    bin_MOS = SPIFFS.open("/MOS.bin", "rb");
-    if(!bin_MOS || !bin_MOS.size()){
-        displayError("Failed to open '/spiffs/MOS.bin' for reading");
-        while(1) ledsFlash();
-    }
-    bin_flash = SPIFFS.open("/flash.bin", "r");
-    if(!bin_flash || !bin_flash.size()){
-        displayError("Failed to open '/spiffs/flash.bin' for reading");
-        while(1) ledsFlash();
-    }
-    bin_MOS.close();
-    bin_flash.close();
-
-    expected_moscrc = getfileCRC("/spiffs/MOS.bin");
 }
 
 
@@ -253,8 +214,7 @@ void init_ez80(void) {
 }
 
 // Upload to ZDI memory from a buffer
-void ZDI_upload(uint32_t address, uint8_t *buffer, uint32_t size, bool report) {
-
+void ZDI_upload(uint32_t address, const uint8_t *buffer, uint32_t size, bool report) {
     while(size > PAGESIZE) {
         zdi->write_memory(address, PAGESIZE, buffer);
         address += PAGESIZE;
@@ -269,7 +229,7 @@ void ZDI_upload(uint32_t address, uint8_t *buffer, uint32_t size, bool report) {
 }
 
 // Upload to ZDI memory from a file
-uint32_t ZDI_upload(uint32_t address, const char *name, bool report) {
+/*uint32_t ZDI_upload(uint32_t address, const char *name, bool report) {
     uint32_t size, retsize;
     uint8_t buffer[PAGESIZE];
 
@@ -286,7 +246,7 @@ uint32_t ZDI_upload(uint32_t address, const char *name, bool report) {
 
     fclose(file);
     return retsize;
-}
+}*/
 
 uint32_t getZDImemoryCRC(uint32_t address, uint32_t size) {
     CRC32 crc;
@@ -312,6 +272,103 @@ uint32_t getZDImemoryCRC(uint32_t address, uint32_t size) {
     return crc.finalize();
 }
 
+/* assembled code for src_flash/flash.s. Aka, flash.bin contents*/
+static const uint8_t flasher_prog[]  = {
+  0x31, 0xff, 0xff, /* LD sp, 0BFFFFh */
+  0x0b, 0x3e, 0x00, /* LD A, 0h */
+  0x32, 0x03, 0x00, 0x07, /* LD (ackdone), A */
+  0x3e, 0xb6, /* LD A, B6h */
+  0xed, 0x39, 0xf5,  /* OUT0 (F5), A*/
+  0x3e, 0x49, /* LD A, 49h */
+  0xed, 0x39, 0xf5,  /* OUT0 (F5), A*/
+  0x3e, 0x00, /* LD      A, 0h   ; unprotect all pages */
+  0xed, 0x39, 0xfa,  /* OUT0    (FAh), A*/
+  0x3e, 0xb6, /* LD      A, B6h  ; unlock again */
+  0xed, 0x39, 0xf5, /* OUT0    (F5h), A */
+  0x3e, 0x49, /* LD      A, 49h */
+  0xed, 0x39, 0xf5, /* OUT0    (F5h), A */
+  0x3e, 0x5f, /* LD      A, 5Fh  ; Ceiling(18Mhz * 5,1us) = 95, or 0x5F */
+  0xed, 0x39, 0xf9, /* OUT0    (F9h), A */
+  0x3e, 0x01, /* LD      A, 01h ; mass erase flash */ 
+  0xed, 0x39, 0xff, /*     OUT0    (FFh), A */
+  0xed, 0x38, 0xff, /* erasewait: IN0     A, (FFh) */
+  0xe6, 0x01, /* AND     A, 01h */
+  0x20, 0xf9, 0x11, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x05, 0xed, 0x4b, 0x00, 0x00, 
+  0x07, 0xed, 0xb0, 0x3e, 0xb6, 0xed, 0x39, 0xf5, 0x3e, 0x49, 0xed, 0x39, 0xf5, 0x3e, 0xff, 0xed, 
+  0x39, 0xfa, 0x3e, 0x01, 0x32, 0x03, 0x00, 0x07, 0x18, 0xfe
+};
+
+void upload_flasher_into_ram() {
+    cpu->setBreak();
+    ZDI_upload(USERLOAD, flasher_prog, sizeof(flasher_prog), true);
+    cpu->pc(USERLOAD);
+    Serial.println("Flasher loaded into RAM, CPU halted.");
+    /* program will now expect "data to flash" */
+}
+
+void upload_block_to_flash(const uint8_t* data, size_t size) {
+    /* we upload the to be flashed data into RAM first, the flasher
+        * program will transfer it from RAM to flash
+    */
+    uint32_t expected_crc = getDataCRC(data, size);
+    cpu->setBreak();
+    ZDI_upload(FLASHLOAD, data, size, true);
+    zdi->write_memory_24bit(MOSSIZE_ADDRESS, size);
+    cpu->pc(USERLOAD);
+    cpu->setContinue(); // start flashloader, no feedback  
+
+    // This is a CRITICAL wait and cannot be interrupted by ZDI
+    for(int n = 0; n < WAITPROGRAMSECS; n++) { 
+        ledsFlash();
+        delay(1000);
+        displayMessage(".");
+    }
+    displayMessage(" done - ");
+
+    /* wait a bit */
+    uint32_t now = millis();
+    // max 20 seconds flashing time
+    uint8_t success = false;
+    while(millis() - now < 20000) {
+        cpu->setBreak();
+        // check ackdone
+        uint8_t ack_done = 0;
+        zdi->read_memory(MOSDONE, 1, &ack_done);
+        // flasher says it's done?
+        if(ack_done == 1) {
+            Serial.println("ACK received!");
+            success = true;
+            break;
+        } else {
+            Serial.println("Flasher wasn't done yet");
+            uint32_t len_rem = 0;
+            zdi->read_memory(MOSSIZE_ADDRESS, 3, (uint8_t*)&len_rem);
+            Serial.println("Remaining length: " + String(len_rem));
+            Serial.println("Current PC: " + String(cpu->pc(), HEX));
+            Serial.println("A: " + String(cpu->a(), HEX));
+            Serial.println("DE: " + String(cpu->de(), HEX));
+            Serial.println("HL: " + String(cpu->hl(), HEX));
+            Serial.println("BC: " + String(cpu->bc(), HEX));
+        }
+        // not yet done: resume program
+        cpu->setContinue();
+        delay(1000);
+    }
+
+    if(!success) {
+        Serial.println("TIMEOUT DURING FLASH!\n");
+        // return;
+    }
+    Serial.println("Verifying CRC32");
+    // final check
+    if(expected_crc == getZDImemoryCRC(0, size)) {
+        displayMessage("CRC32 OK\r\n");
+    }
+    else {
+        displayError("CRC32 ERROR\r\n");
+    }
+}
+#if 0
 void flashMOS(void) {
     uint32_t size;
 
@@ -360,24 +417,17 @@ void flashMOS(void) {
         displayError("CRC32 ERROR\r\n");
     }
 }
+#endif
 
 void printSerialMenu(void) {
     Serial.printf("\r\n\r\n---------------------------------\r\n");
     Serial.printf(zdi_msg_up, zdi->get_productid(), zdi->get_revision());
     Serial.printf("---------------------------------\r\n");
     Serial.printf(menuHeader);
-    Serial.printf(menuMessage);
-}
-
-void printVGAMenu(void) {
-    terminal.printf("\r\n");
-    terminal.printf(menuMessage);
 }
 
 void printMenus(void) {
-    vga_status_screen();
     printSerialMenu();
-    printVGAMenu();
 }
 
 void zdiStatusMessage(void) {
@@ -388,7 +438,6 @@ void zdiStatusMessage(void) {
         ledsErrorFlash();
         ledsOff();
         Serial.printf(zdi_msg_down);
-        vga_status_screen();
         delay(500);
     }
     if(needmenu) {
@@ -402,88 +451,61 @@ void zdiStatusMessage(void) {
 // or 0 when nothing is pressed
 // Non-blocking
 char getKey(void) {
-    fabgl::Keyboard *kb = PS2Controller.keyboard();
-    fabgl::VirtualKeyItem item;
     char key = 0;
-
     if(Serial.available()) key = Serial.read();
-    if(kb->getNextVirtualKey(&item, 0) && item.down) key = item.ASCII;
-
     return key;
 }
 
-void handle_MOS_option(void) {
-    char key;
-
-    displayMessage("\r\nRecover MOS (y/n)?");
-    while(!(key = getKey()));
-    if(toUpperCase(key) == 'Y') {
-        flashMOS();
+bool process_block(void *blk_id, size_t idSize, byte *data, size_t dataSize) {
+    byte id = *((byte *) blk_id);
+    //just copy into RAM buffer for now
+    last_block_receive_time = millis();
+    received_one_block = true;
+    if(flash_buf_idx + dataSize < EZ80F92_FLASHSIZE) {
+        memcpy(&flash_buf[flash_buf_idx], data, dataSize);
+        flash_buf_idx += dataSize;
+        return true;
+    } else {
+        // can't hold that much data
+        return false;
     }
-    else displayMessage("\r\nAborted\r\n");
-    delay(3000);
-}
-
-void handle_VDP_option(void) {
-    char key;
-
-    displayMessage("\r\nRecover VDP (y/n)?");
-    while(!(key = getKey()));    
-    if(toUpperCase(key) == 'Y') {
-        displayMessage("\r\nSwitching to VDP partition...");
-        switch_ota();
-        displayMessage(" done\r\nPress reset button to activate...");
-    }
-    else displayMessage("\r\nAborted\r\n");
-    delay(5000);
-}
-
-void handle_FULL_option(void) {
-    char key;
-
-    displayMessage("\r\nRecover MOS and VDP (y/n)?");
-    while(!(key = getKey()));    
-    if(toUpperCase(key) == 'Y') {
-        flashMOS();
-        delay(500);
-        displayMessage("\r\nSwitching to VDP partition...");
-        switch_ota();
-        displayMessage(" done\r\nPress reset button to activate...");
-    }
-    else displayMessage("\r\nAborted\r\n");
-    delay(3000);
 }
 
 void loop() {
     zdiStatusMessage();
-
-    // Handle keyboard
-    if(char key = getKey()) {
-        switch(key) {
-            case '1':
-                handle_FULL_option();
-                break;
-            case '2':
-                handle_MOS_option();
-                break;
-            case '3':
-                handle_VDP_option();
-                break;
-            default:
-                break;
+    if(Serial.available() > 0) {
+        char c = (char) Serial.read();
+        // write command?
+        if( c == 'w') {
+            init_ez80();
+            upload_flasher_into_ram();
+            Serial.println("Send file to be uploaded to 0x00000 via XModem now!");
+            Serial.flush();
+            flash_buf_idx = 0;
+            last_block_receive_time = millis();
+            received_one_block = false;
+            xmodem.setRecieveBlockHandler(process_block);
+            // process X modem until we detect a timeout of 200ms
+            // but at least wait until one block is received
+            //while(true) {
+            bool ok = xmodem.receive();
+            Serial.println("RX OK: " + String(ok));
+                //if(millis() - last_block_receive_time >= 2000 && received_one_block) {
+                //    break;
+                //}
+                //if((millis() / 1000) % 10 == 9) {
+                //    Serial.println("Still waiting for data");
+            Serial.println("idx: " + String(flash_buf_idx));
+            Serial.println("last receive: " + String(last_block_receive_time));
+            Serial.println("one block received: " + String(received_one_block));
+                //}
+            //}
+            // we don't use xmodem anymore, back to regular serial
+            Serial.println("Received " + String(flash_buf_idx) + " Bytes to flash");
+            upload_block_to_flash(flash_buf, flash_buf_idx);
+            Serial.println("Upload done!");
+        } else if(c == 'r') {
+            // read command?
         }
-        printMenus();
-    }
-
-    // Handle physical button
-    if(directRead(0) == 0) btn_pressed = true;
-    else {
-        btn_pressed = false;
-        time0 = millis();
-    }
-    if(btn_pressed && (millis() - time0) > WAITHOLDBUTTONMS) {
-        flashMOS();
-        delay(3000);
-        printMenus();
     }
 }

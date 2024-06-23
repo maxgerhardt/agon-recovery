@@ -170,7 +170,7 @@ void ZDI::read_memory (uint32_t address, uint32_t count, uint8_t* buffer) {
     write_cpu_register(ZDI_RWControl::pc, oldpc);
 }
 
-void ZDI::write_memory(uint32_t address, uint32_t count, uint8_t* buffer) {
+void ZDI::write_memory(uint32_t address, uint32_t count, const uint8_t* buffer) {
     uint32_t oldpc;
     uint32_t i;
 
