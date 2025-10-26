@@ -77,8 +77,8 @@ def main():
     while True:
         rx = getc(4096, timeout=10)
         if rx != None and len(rx)> 0:
-            content += rx.decode('utf-8')
-            print(rx.decode('utf-8'), end='')
+            content += rx.decode('utf-8', errors='ignore')
+            print(rx.decode('utf-8', errors="ignore"), end='')
             if "ZDI up" in content:
                 break
             if "ZDI down" in content:
