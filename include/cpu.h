@@ -31,6 +31,8 @@ uint32_t getBreakpoint(uint8_t index);
     void instruction_out(uint8_t port_address, uint8_t value);
     void instruction_di(void);
     void exx(void);
+
+    void printZDIStatus(void);
     
     // get-set CPU registers
      uint8_t a(void);

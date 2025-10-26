@@ -305,7 +305,54 @@ void CPU::instruction_di(void) {
 
 void CPU::reset(void) {
     zdi->write_register(ZDI::ZDI_MASTER_CTL, 0x80);
+    delay(10);
+    uint8_t ctl = 0;
+    do {
+        ctl = zdi->read_register(ZDI::ZDI_MASTER_CTL);
+    } while((ctl & 0x80) == 1); // wait until it's cleared to 0 again
 }
+
+void CPU::printZDIStatus(){
+    uint8_t statu = zdi->read_register(ZDI::ZDI_STAT);
+    Serial.println("ZDI status register: 0x" + String(statu, HEX));
+    if((statu & (1u << 7u)) != 0) {
+        Serial.println("CPU in ZDI mode");
+    } else {
+        Serial.println("CPU not in ZDI mode");
+    }
+    if((statu & (1u << 5u)) != 0) {
+        Serial.println("CPU is in HALT or SLEEP mode");
+    } else {
+        Serial.println("CPU not in HALT or SLEEP mode");
+    }
+    if((statu & (1u << 4u)) != 0) {
+        Serial.println("CPU is in ADL MEMORY mode");
+    } else {
+        Serial.println("CPU is in Z80 MEMORY mode");
+    }
+    if((statu & (1u << 3u)) != 0) {
+        Serial.println("CPU is in Mixed-memory (MADL) mode");
+    } else {
+        Serial.println("CPU is not in Mixed-memory (MADL) mode");
+    }
+    if((statu & (1u << 2u)) != 0) {
+        Serial.println("CPU's maskable interrupts are enabled");
+    } else {
+        Serial.println("CPU's maskable interrupts are disabled");
+    }
+    uint8_t bus_ctl = zdi->read_register(ZDI::ZDI_BUS_CTL);
+    if( (bus_ctl & (1 << 7)) != 0) {
+        Serial.println("Bus requests are ignored.");
+    } else {
+        Serial.println("Bus requests are accepted.");
+    }
+    if( (bus_ctl & (1 << 6)) != 0) {
+        Serial.println("ZDI_BUSACK: 1");
+    } else {
+        Serial.println("ZDI_BUSACK: 0");
+    }
+}
+
 void CPU::exx(void) {
     zdi->write_register(ZDI::ZDI_RW_CTL, ZDI::exx);
 }

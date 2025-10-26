@@ -3,8 +3,6 @@
 #include "eZ80F92.h"
 #include <esp_task_wdt.h>
 #include "esp32_io.h"
-#include "updater.h"
-#include "message.h"
 #include <CRC32.h>
 #include <XModem.h>
 
@@ -48,6 +46,14 @@ char zdi_msg_down[] = "ZDI down - check cabling\r\n";
 char menuHeader[] = "Agon flashing utility v1.0\r\n\r\n";
 
 bool process_block(void *blk_id, size_t idSize, byte *data, size_t dataSize);
+
+void displayMessage(const char *msg) {
+    Serial.printf(msg);
+}
+
+void displayError(const char *msg) {
+    displayMessage(msg);
+}
 
 void setupLedPins(void) {
     for(int n = 0; n < (sizeof(ledpins) / sizeof(int)); n++)
@@ -117,7 +123,8 @@ void setup() {
     esp_task_wdt_init(30, false); // in case WDT cannot be removed
 
     // Serial
-    Serial.begin(115200);
+    Serial.setRxBufferSize(2048);
+    Serial.begin(921600);
 
     flash_buf = (uint8_t*) malloc(EZ80F92_FLASHSIZE);
     if(flash_buf == nullptr) {
@@ -146,12 +153,18 @@ void setup() {
 
     //expected_moscrc = getfileCRC("/spiffs/MOS.bin");
     // initialize some stuff
-    xmodem.begin(Serial, XModem::ProtocolType::XMODEM);
+    xmodem.begin(Serial, XModem::ProtocolType::CRC_XMODEM);
 
 }
 
+void dumpCPUReg();
+
 
 void init_ez80(void) {
+    cpu->reset();
+    cpu->SingleStep();
+    cpu->instruction_di ();
+    
     cpu->setBreak();
     cpu->setADLmode(true);
     cpu->instruction_di();  
@@ -211,6 +224,11 @@ void init_ez80(void) {
     cpu->sp(0x0BFFFF);
     // set program counter
     cpu->pc(0x000000);
+
+    //cpu->setBreak();
+    //cpu->instruction_di();
+
+    //dumpCPUReg();
 }
 
 // Upload to ZDI memory from a buffer
@@ -227,26 +245,6 @@ void ZDI_upload(uint32_t address, const uint8_t *buffer, uint32_t size, bool rep
     if(report) displayMessage(".");
     ledsFlash();
 }
-
-// Upload to ZDI memory from a file
-/*uint32_t ZDI_upload(uint32_t address, const char *name, bool report) {
-    uint32_t size, retsize;
-    uint8_t buffer[PAGESIZE];
-
-    FILE *file = fopen(name, "r");
-    
-    retsize = 0;
-    while(size = fread(buffer, 1, PAGESIZE, file)) {
-        zdi->write_memory(address, size, buffer);
-        address += size;
-        retsize += size;
-        ledsFlash();
-        if(report) displayMessage(".");
-    }
-
-    fclose(file);
-    return retsize;
-}*/
 
 uint32_t getZDImemoryCRC(uint32_t address, uint32_t size) {
     CRC32 crc;
@@ -298,12 +296,50 @@ static const uint8_t flasher_prog[]  = {
   0x39, 0xfa, 0x3e, 0x01, 0x32, 0x03, 0x00, 0x07, 0x18, 0xfe
 };
 
+void dumpCPUReg(bool show_zdi_status = false, bool do_continue = true);
+
+void dumpCPUReg(bool show_zdi_status, bool do_break_and_continue) {
+    if (do_break_and_continue) {
+        cpu->setBreak();
+    }
+    //cpu->instruction_di();
+    //uint32_t len_rem = 0;
+    //zdi->read_memory(MOSSIZE_ADDRESS, 3, (uint8_t*)&len_rem);
+   // Serial.println("Remaining length: " + String(len_rem));
+    Serial.println("Current PC: " + String(cpu->pc(), HEX));
+    Serial.println("Current SP: " + String(cpu->sp(), HEX));
+    Serial.println("A: " + String(cpu->a(), HEX));
+    Serial.println("DE: " + String(cpu->de(), HEX));
+    Serial.println("HL: " + String(cpu->hl(), HEX));
+    Serial.println("BC: " + String(cpu->bc(), HEX));
+    Serial.println("IX: " + String(cpu->ix(), HEX));
+    Serial.println("IY: " + String(cpu->iy(), HEX));
+    if(show_zdi_status)
+        cpu->printZDIStatus();
+    Serial.println("=== END OF CPU DUMP === ");
+
+    if (do_break_and_continue)
+        cpu->setContinue();
+
+    // cpu->a(0xC0);
+    // cpu->b(0xFE);
+    // cpu->c(0xBA);
+    // Serial.println("=== AFTER CHANGING CPU REGS === ");
+    // Serial.println("A: " + String(cpu->a(), HEX));
+    // Serial.println("BC: " + String(cpu->bc(), HEX));
+}
+
 void upload_flasher_into_ram() {
     cpu->setBreak();
     ZDI_upload(USERLOAD, flasher_prog, sizeof(flasher_prog), true);
     cpu->pc(USERLOAD);
+    //cpu->setContinue();
     Serial.println("Flasher loaded into RAM, CPU halted.");
     /* program will now expect "data to flash" */
+    //Serial.println("State after uploading flasher program");
+    //delay(500);
+    //cpu->setBreak();
+    //dumpCPUReg();
 }
 
 void upload_block_to_flash(const uint8_t* data, size_t size) {
@@ -367,57 +403,9 @@ void upload_block_to_flash(const uint8_t* data, size_t size) {
     else {
         displayError("CRC32 ERROR\r\n");
     }
+
+    dumpCPUReg(true);
 }
-#if 0
-void flashMOS(void) {
-    uint32_t size;
-
-    init_ez80();
-
-    // Upload the MOS payload to ZDI memory first
-    displayMessage("\r\nUploading MOS...");
-    ledsFlash();
-    size = ZDI_upload(FLASHLOAD, "/spiffs/MOS.bin", true);
-    displayMessage(" done - ");
-    if(expected_moscrc == getZDImemoryCRC(FLASHLOAD, size)) {
-        displayMessage("CRC32 OK\r\n");
-    }
-    else {
-        displayError("CRC32 ERROR\r\n");
-        return;
-    }
-    zdi->write_memory_24bit(MOSSIZE_ADDRESS, size);
-    ledsFlash();
-     
-    // Upload the flash tool to ZDI memory next, so it can pick up the payload
-    displayMessage("Uploading flash tool...");
-    ledsFlash();
-    ZDI_upload(USERLOAD, "/spiffs/flash.bin", true);
-    ledsFlash();
-
-    // Run the CPU from the flash tool address
-    displayMessage("\r\nFlashing MOS...");
-    cpu->pc(USERLOAD);
-    cpu->setContinue(); // start flashloader, no feedback  
-
-    // This is a CRITICAL wait and cannot be interrupted by ZDI
-    for(int n = 0; n < WAITPROGRAMSECS; n++) { 
-        ledsFlash();
-        delay(1000);
-        displayMessage(".");
-    }
-    displayMessage(" done - ");
-    
-    // Final check
-    cpu->setBreak();
-    if(expected_moscrc == getZDImemoryCRC(0, size)) {
-        displayMessage("CRC32 OK\r\n");
-    }
-    else {
-        displayError("CRC32 ERROR\r\n");
-    }
-}
-#endif
 
 void printSerialMenu(void) {
     Serial.printf("\r\n\r\n---------------------------------\r\n");
@@ -471,41 +459,119 @@ bool process_block(void *blk_id, size_t idSize, byte *data, size_t dataSize) {
     }
 }
 
+void hexdump(const void* data, size_t size) {
+	char ascii[17];
+	size_t i, j;
+	ascii[16] = '\0';
+	for (i = 0; i < size; ++i) {
+		Serial.printf("%02X ", ((unsigned char*)data)[i]);
+		if (((unsigned char*)data)[i] >= ' ' && ((unsigned char*)data)[i] <= '~') {
+			ascii[i % 16] = ((unsigned char*)data)[i];
+		} else {
+			ascii[i % 16] = '.';
+		}
+		if ((i+1) % 8 == 0 || i+1 == size) {
+			Serial.printf(" ");
+			if ((i+1) % 16 == 0) {
+				Serial.printf("|  %s \n", ascii);
+			} else if (i+1 == size) {
+				ascii[(i+1) % 16] = '\0';
+				if ((i+1) % 16 <= 8) {
+					Serial.printf(" ");
+				}
+				for (j = (i+1) % 16; j < 16; ++j) {
+					Serial.printf("   ");
+				}
+				Serial.printf("|  %s \n", ascii);
+			}
+		}
+	}
+}
+
 void loop() {
     zdiStatusMessage();
     if(Serial.available() > 0) {
         char c = (char) Serial.read();
         // write command?
         if( c == 'w') {
+            // expecet the length of the transmission next
+            String full_length_str = Serial.readStringUntil('\n');
+            // convert to int
+            size_t expectedSize = (size_t) full_length_str.toInt();
             init_ez80();
             upload_flasher_into_ram();
-            Serial.println("Send file to be uploaded to 0x00000 via XModem now!");
-            Serial.flush();
             flash_buf_idx = 0;
             last_block_receive_time = millis();
             received_one_block = false;
+            xmodem.bufferPacketReads(false);
             xmodem.setRecieveBlockHandler(process_block);
-            // process X modem until we detect a timeout of 200ms
-            // but at least wait until one block is received
-            //while(true) {
+            Serial.println("Preparing to receive " + String(expectedSize) + " bytes via XModem now!");
+            Serial.flush();
+            delay(500); // the receive will send the "C" byte
+            xmodem.bufferPacketReads(true);
             bool ok = xmodem.receive();
             Serial.println("RX OK: " + String(ok));
-                //if(millis() - last_block_receive_time >= 2000 && received_one_block) {
-                //    break;
-                //}
-                //if((millis() / 1000) % 10 == 9) {
-                //    Serial.println("Still waiting for data");
-            Serial.println("idx: " + String(flash_buf_idx));
-            Serial.println("last receive: " + String(last_block_receive_time));
-            Serial.println("one block received: " + String(received_one_block));
-                //}
-            //}
-            // we don't use xmodem anymore, back to regular serial
+            //Serial.println("last receive time: " + String(last_block_receive_time));
+            //Serial.println("one block received: " + String(received_one_block));
             Serial.println("Received " + String(flash_buf_idx) + " Bytes to flash");
+            if(flash_buf_idx >= expectedSize) {
+                // Limitation of XModem: Last bytes are padding, cut them off as we know the expected size
+                flash_buf_idx = expectedSize;
+                Serial.println("Cutting of padding to match expected size: " + String(flash_buf_idx) + " Bytes");
+            } else {
+                Serial.println("ERROR: Received less data than expected!");
+                return;
+            }
+            // compute CRC32 of received data
+            uint32_t received_crc = getDataCRC(flash_buf, flash_buf_idx);
+            Serial.println("Received data CRC32: " + String(received_crc, HEX));
+
+            //Serial.println("Received data:");
+            //hexdump(flash_buf, flash_buf_idx);
+
             upload_block_to_flash(flash_buf, flash_buf_idx);
             Serial.println("Upload done!");
+        } else if(c == 'd') {
+            // dump registers
+            //init_ez80();
+            dumpCPUReg(true);
         } else if(c == 'r') {
-            // read command?
+            // read flash
+            // read start address and length
+            String start_addr_dec_str = Serial.readStringUntil(' ');
+            String len_dec_str = Serial.readStringUntil('\n');
+            // convert to int
+            uint32_t start_addr = (uint32_t) start_addr_dec_str.toInt();
+            uint32_t len = (uint32_t) len_dec_str.toInt();
+            //Serial.println("Reading " + String(len) + " bytes from address 0x" + String(start_addr, HEX));
+            // read blockwise and stream out via hexdump
+            uint8_t buffer[256];
+            init_ez80();
+            while(len > 0) {
+                uint32_t to_read = (len > sizeof(buffer)) ? sizeof(buffer) : len;
+                zdi->read_memory(start_addr, to_read, buffer);
+                // write directly to serial
+                Serial.write(buffer, to_read);
+                start_addr += to_read;
+                len -= to_read;
+            }
+            Serial.println("Read done.");
+        } else if(c == 'p') {
+            // "powercycle", aka reset 
+            cpu->reset();
+            Serial.println("CPU Reset performed.");
+        }
+        else if(c == 's') {
+            // single step n times
+            String num_steps_str = Serial.readStringUntil(' ');
+            uint32_t num_steps = (uint32_t) num_steps_str.toInt();
+            init_ez80(); // reset CPU to known state
+            for(uint32_t n = 0; n < num_steps; n++) {
+                cpu->SingleStep();
+                Serial.println("== Single Step " + String(n+1) + " ==");
+                dumpCPUReg(false, false);
+            }
+            Serial.println("Single stepping done.");
         }
     }
 }
