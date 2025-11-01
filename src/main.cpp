@@ -117,7 +117,16 @@ uint32_t getfileCRC(const char *name) {
     return crc.finalize();
 }
 
+#include <serial.h>
+
 void setup() {
+    // Commented out functions are for flow control
+    //Serial2.setPins(UART_RX, UART_TX, UART_CTS, UART_RTS);
+    //Serial2.setHwFlowCtrlMode(UART_HW_FLOWCTRL_CTS_RTS);
+    //Serial2.setRxBufferSize(UART_RX_SIZE);
+    //Serial2.setRxFIFOFull(UART_RX_THRESH);
+    Serial2.begin(115200, SERIAL_8N1, UART_RX, UART_TX);
+
     // Disable the watchdog timers
     disableCore0WDT(); delay(200);								
     esp_task_wdt_init(30, false); // in case WDT cannot be removed
@@ -490,6 +499,12 @@ void hexdump(const void* data, size_t size) {
 
 void loop() {
     zdiStatusMessage();
+    // Forward UART data from eZ80 to main serial
+    while(Serial2.available()) {
+        char c = (char) Serial2.read();
+        Serial.write(c); // echo to main serial
+    }
+
     if(Serial.available() > 0) {
         char c = (char) Serial.read();
         // write command?
